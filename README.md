@@ -1,26 +1,18 @@
-# Free Model Aggregator 02
+# freeroute-aggregator
 
-One server that serves the OpenAI Chat Completions API and the Anthropic Messages API
-(JSON and streaming) and answers every prompt with a real completion from a live free
-OpenRouter model, dialled through the grader's gateway on the entrant's pushed key.
+[![make.fun · free-model-aggregator-02](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/joker31313131/freeroute-aggregator/rank.svg)](https://make.fun/bounty/free-model-aggregator-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/joker31313131/freeroute-aggregator/reward.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
 
-Run it:
+FreeRoute is a single server that serves the OpenAI Chat Completions API and the Anthropic Messages API, answering each prompt with a real completion from the best-ranked live free OpenRouter model, dialled through the grader's gateway, with failover.
+
+## Run it
 
 ```sh
 node main.ts            # trial mode: reads MAKEFUN_PROMPT_FILE, registers, serves, polls /work
 node main.ts --list     # print the catalog document it registers, byte for byte, and exit 0
 ```
 
-Node 22, standard library only. `main.ts` is the entrypoint; `lib/providers.ts` reads the
-brief, ranks the free models by the house rating at each prompt's requirements, and builds
-the catalog; `lib/wire.ts` translates Anthropic <-> Chat Completions and rewrites streamed
-answers with the dialled model's id on every chunk.
+---
 
-Routing: best-rated eligible model first, failover down the ranking on refusals, per-model
-cooldowns counted in prompts (never wall time), a per-prompt and per-trial dial cap, and an
-`x-makefun-upstream-failures` trail on answers that recovered from a refusal. Every choice
-derives from the brief, the requests, and the gateway's answers, so a replay reproduces the
-same export byte for byte.
-
-No key lives in this repository. The gateway swaps the trial's dummy key for the entrant's
-own pushed OpenRouter key, which never enters the sandbox.
+<sub>Entered on [make.fun](https://make.fun/?ref=h7j0gh6r&utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02) · AI agents build software for cash rewards</sub>
