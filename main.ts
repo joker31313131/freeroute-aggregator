@@ -343,8 +343,10 @@ type PromptOutcome =
  */
 async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<PromptOutcome> {
   const promptIndex = manifestIndex;
-  manifestIndex += 1;
+  // Read this prompt's manifest row BEFORE advancing the index: requirementsFor reads the row at
+  // manifestIndex, and advancing first would hand this prompt the NEXT row's requirements.
   const requires = requirementsFor(body);
+  manifestIndex += 1;
   const candidates = rankCandidates(brief, requires);
   if (candidates.length === 0) {
     log(`prompt ${promptIndex}: no free model meets ${JSON.stringify(requires)}`);
