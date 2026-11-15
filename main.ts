@@ -35,7 +35,12 @@
 // soft failure too, but a recorded one: the trail carries a row for it (the dial's real status,
 // 200, and the reason), and the prompt moves to the next candidate at once, with no retry and no
 // cooldown. The tool-name check runs only on prompts that require tools, because the env reads
-// tool names only there.
+// tool names only there. A dial that answers nothing within 20 s is aborted for real and recorded
+// as the 499 refusal the forwarder settles for it (trail row, cooldown, next candidate at once,
+// no retry): a hung dial must never stall the serial queue or the prompts behind it, and live and
+// replay must walk the same candidates. The 20 s timeout is the one wall-clock input: it fires
+// only when the gateway answers nothing at all, so a responsive gateway — and every replay —
+// decides exactly as before.
 //
 // CAPS: at most 8 dials a prompt and 54 a trial (the gateway refuses past 60), counted, never timed.
 // Every dial names max_tokens, never below 1024 and never above 8192. No wall clock and no
@@ -96,6 +101,8 @@ const COOLDOWN_SPAN = 2;
 const MIN_UPSTREAM_MAX_TOKENS = 1024;
 /** The most output tokens any upstream dial asks for: the gateway refuses a larger ask. */
 const MAX_UPSTREAM_MAX_TOKENS = 8192;
+/** How long one gateway dial may run before it is aborted: below the env's 30 s per-prompt cap, so a hung dial fails over with time to spare. */
+const DIAL_TIMEOUT_MS = 20000;
 /** How many times /register is attempted before the server gives up. */
 const REGISTER_ATTEMPTS = 5;
 /** The fixed wait between /register attempts, in milliseconds: timing only, never a decision. */
@@ -279,25 +286,35 @@ async function readUpstreamText(res: Response): Promise<string | null> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-/** One dial's outcome: an HTTP answer with its body text, or a refusal the network itself raised. */
+/** One dial's outcome: an HTTP answer with its body text, a refusal the network itself raised, or a dial aborted after answering nothing within the timeout. */
 type DialOutcome =
   | { kind: 'answered'; status: number; text: string | null }
-  | { kind: 'unreachable'; message: string };
+  | { kind: 'unreachable'; message: string }
+  | { kind: 'timeout' };
 
-/** POST one request to the gateway's Chat Completions route, naming the model this entry dialled. */
+/** POST one request to the gateway's Chat Completions route, naming the model this entry dialled. A dial that answers nothing within DIAL_TIMEOUT_MS is aborted for real: the signal kills the connection, and a body that stalls mid-stream errors the read, so neither wait can hang the serial queue. */
 async function dial(model: string, body: Json): Promise<DialOutcome> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     authorization: `Bearer ${GATEWAY_KEY}`,
   };
   if (body.stream === true) headers.accept = 'text/event-stream';
+  const signal = AbortSignal.timeout(DIAL_TIMEOUT_MS);
   let res: Response;
   try {
-    res = await fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }) });
+    res = await fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }), signal });
   } catch (err) {
+    if (signal.aborted) return { kind: 'timeout' };
     return { kind: 'unreachable', message: (err as Error).message };
   }
-  return { kind: 'answered', status: res.status, text: await readUpstreamText(res) };
+  let text: string | null;
+  try {
+    text = await readUpstreamText(res);
+  } catch (err) {
+    if (signal.aborted) return { kind: 'timeout' };
+    throw err;
+  }
+  return { kind: 'answered', status: res.status, text };
 }
 
 /** A translated gateway answer, ready to send downstream in the wire the client used. */
@@ -479,9 +496,11 @@ type PromptOutcome =
 /**
  * Serve one prompt: walk the ranked candidates, dialling each at most once (plus one immediate
  * retry on a 5xx at the same cap, and one retry at twice the cap on a 200 without the token),
- * skipping models in cooldown and answers whose shape the env would refuse, until one answers
- * with a body carrying the prompt's token — or the attempt and trial caps run out. Deterministic
- * in the brief, the request, the prompt index, and the gateway's answers: no clock, no randomness.
+ * skipping models in cooldown and answers whose shape the env would refuse, and aborting a dial
+ * that answers nothing within 20 s, until one answers with a body carrying the prompt's token —
+ * or the attempt and trial caps run out. Deterministic in the brief, the request, the prompt
+ * index, and the gateway's answers: no clock, no randomness, apart from the dial timeout, which
+ * fires only when the gateway answers nothing at all.
  */
 async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<PromptOutcome> {
   const promptIndex = manifestIndex;
@@ -537,6 +556,20 @@ async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<Pr
     upstreamBody.max_tokens = dialCap;
     const outcome = await dial(model.id, upstreamBody);
 
+    if (outcome.kind === 'timeout') {
+      // A hung dial is recorded exactly as the replay of this trial will see it: the forwarder
+      // settles an aborted dial as HTTP 499 with error code `client_closed_request`, and the
+      // replay serves that refusal — so the timeout carries the same trail row, the same
+      // cooldown, and the same last status as the refusal. Without the cooldown, live and
+      // replay would walk different candidates and the trial would not reproduce. No retry:
+      // a second hang would eat the prompt's remaining time. The attempt and trial caps
+      // already counted this dial, so they still bind.
+      log(`prompt ${promptIndex}: ${model.id} timed out after ${DIAL_TIMEOUT_MS} ms`);
+      failures.push({ status: 499, code: 'client_closed_request', model: model.id });
+      cooldownUntil.set(model.id, promptIndex + COOLDOWN_SPAN);
+      lastStatus = 499;
+      continue;
+    }
     if (outcome.kind === 'unreachable') {
       log(`prompt ${promptIndex}: ${model.id} unreachable (${outcome.message.slice(0, 120)})`);
       failures.push({ status: 502, code: 'upstream_unreachable', model: model.id });
