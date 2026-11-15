@@ -29,7 +29,13 @@
 // before the prompt moves on: a reasoning model can spend a small cap before reaching content, and
 // a second dial with room to answer is worth more than abandoning the best-ranked candidate. The
 // retry carries no trail row, because no refusal happened, and the model is NOT cooled down for
-// it, because a missed echo on one prompt is weak evidence against the next.
+// it, because a missed echo on one prompt is weak evidence against the next. A 200 that answers
+// in a shape the env would reject — an illegal finish reason, an output usage below 1, a streamed
+// chunk with no choices, a second finish chunk, or a tool call the request never declared — is a
+// soft failure too, but a recorded one: the trail carries a row for it (the dial's real status,
+// 200, and the reason), and the prompt moves to the next candidate at once, with no retry and no
+// cooldown. The tool-name check runs only on prompts that require tools, because the env reads
+// tool names only there.
 //
 // CAPS: at most 8 dials a prompt and 54 a trial (the gateway refuses past 60), counted, never timed.
 // Every dial names max_tokens, never below 1024 and never above 8192. No wall clock and no
@@ -66,6 +72,7 @@ import {
   openAIStreamFromText,
   openAIToAnthropic,
   openAIUpstreamBody,
+  parseSseFrames,
   textOfAnthropicJson,
   textOfOpenAIJson,
   type ServedModel,
@@ -302,6 +309,133 @@ interface Translated {
   answerText: string;
 }
 
+/** The finish_reason values the env accepts on the OpenAI wire (its legal stop reasons). */
+const LEGAL_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter']);
+
+/** The tool names a request declares, from its upstream Chat Completions body. */
+function declaredToolNames(upstreamBody: Json): Set<string> {
+  const names = new Set<string>();
+  if (Array.isArray(upstreamBody.tools)) {
+    for (const tool of upstreamBody.tools) {
+      if (isRecord(tool) && isRecord(tool.function) && typeof tool.function.name === 'string' && tool.function.name !== '') {
+        names.add(tool.function.name);
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * A 200 JSON answer's shape defect, or null when the env would accept it: an illegal finish
+ * reason, an output usage below 1, or — on prompts that require tools — a tool call the request
+ * never declared. A missing finish reason is fine (the translators default it to `stop`), and a
+ * missing usage is fine (the translators estimate the output count); only a stated value the env
+ * rejects counts. Empty tool names are ignored, as the env ignores them.
+ */
+function invalidJsonAnswer(parsed: Json, declared: Set<string>, checkTools: boolean): string | null {
+  const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : null;
+  if (choice !== null) {
+    const finish = choice.finish_reason;
+    if (typeof finish === 'string' && finish !== '' && !LEGAL_FINISH_REASONS.has(finish)) return 'invalid_finish_reason';
+    const message = isRecord(choice.message) ? choice.message : null;
+    if (checkTools && message !== null && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        if (
+          isRecord(call) &&
+          isRecord(call.function) &&
+          typeof call.function.name === 'string' &&
+          call.function.name !== '' &&
+          !declared.has(call.function.name)
+        ) {
+          return 'undeclared_tool';
+        }
+      }
+    }
+  }
+  const usage = isRecord(parsed.usage) ? parsed.usage : null;
+  if (usage !== null && typeof usage.completion_tokens === 'number' && usage.completion_tokens < 1) return 'invalid_usage';
+  return null;
+}
+
+/**
+ * A 200 SSE answer's shape defect, or null when the env would accept it. The walk mirrors the
+ * relay's drops — unparseable chunks, non-objects, a non-array choices, a non-object first choice,
+ * and everything after the first [DONE] never reach the env, so they cannot condemn the answer —
+ * and then checks what survives: every chunk carries a choices array, at most one chunk carries a
+ * finish reason (none is fine: the relay synthesizes one), every finish reason is legal, the last
+ * usage record reports an output of at least 1, and — on prompts that require tools — every named
+ * tool call was declared by the request.
+ */
+function invalidStreamAnswer(text: string, declared: Set<string>, checkTools: boolean): string | null {
+  const frames = parseSseFrames(text);
+  let finishChunks = 0;
+  let lastUsage: Json | null = null;
+  for (const frame of frames) {
+    const payload = frame.data.trim();
+    if (payload === '[DONE]') break;
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (!isRecord(chunk)) continue;
+    if (chunk.choices !== undefined && !Array.isArray(chunk.choices)) continue;
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    if (choices.length > 0 && !isRecord(choices[0])) continue;
+    if (!('choices' in chunk)) return 'invalid_sse_chunk';
+    if (isRecord(chunk.usage)) lastUsage = chunk.usage;
+    const choice = isRecord(choices[0]) ? choices[0] : null;
+    if (choice === null) continue;
+    const finish = choice.finish_reason;
+    if (typeof finish === 'string') {
+      if (!LEGAL_FINISH_REASONS.has(finish)) return 'invalid_finish_reason';
+      finishChunks += 1;
+      if (finishChunks > 1) return 'multiple_finish_chunks';
+    }
+    if (checkTools) {
+      const delta = isRecord(choice.delta) ? choice.delta : null;
+      if (delta !== null && Array.isArray(delta.tool_calls)) {
+        for (const call of delta.tool_calls) {
+          if (
+            isRecord(call) &&
+            isRecord(call.function) &&
+            typeof call.function.name === 'string' &&
+            call.function.name !== '' &&
+            !declared.has(call.function.name)
+          ) {
+            return 'undeclared_tool';
+          }
+        }
+      }
+    }
+  }
+  if (lastUsage !== null) {
+    const output = lastUsage.completion_tokens;
+    if (typeof output !== 'number' || output < 1) return 'invalid_usage';
+  }
+  return null;
+}
+
+/**
+ * A 200 gateway answer's shape defect, or null when the env would accept it. The defect code is
+ * the trail row's code when the prompt fails over on it. Unparseable JSON returns null: the
+ * translator has already rejected the body by then.
+ */
+function validateUpstream(stream: boolean, text: string, upstreamBody: Json, checkTools: boolean): string | null {
+  const declared = checkTools ? declaredToolNames(upstreamBody) : new Set<string>();
+  if (stream) return invalidStreamAnswer(text, declared, checkTools);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  return invalidJsonAnswer(parsed, declared, checkTools);
+}
+
 /**
  * One 200 gateway answer translated into the client's wire, or null when the answer is unusable
  * (not JSON on a JSON prompt, or no first choice with a message). Streaming answers always
@@ -345,9 +479,9 @@ type PromptOutcome =
 /**
  * Serve one prompt: walk the ranked candidates, dialling each at most once (plus one immediate
  * retry on a 5xx at the same cap, and one retry at twice the cap on a 200 without the token),
- * skipping models in cooldown, until one answers with a body carrying the prompt's token — or the
- * attempt and trial caps run out. Deterministic in the brief, the request, the prompt index, and
- * the gateway's answers: no clock, no randomness.
+ * skipping models in cooldown and answers whose shape the env would refuse, until one answers
+ * with a body carrying the prompt's token — or the attempt and trial caps run out. Deterministic
+ * in the brief, the request, the prompt index, and the gateway's answers: no clock, no randomness.
  */
 async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<PromptOutcome> {
   const promptIndex = manifestIndex;
@@ -436,6 +570,15 @@ async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<Pr
     const translated = translate(wire, stream, outcome.text, model.id);
     if (translated === null) {
       log(`prompt ${promptIndex}: ${model.id} answered an unusable body`);
+      continue;
+    }
+    // A 200 in a shape the env would reject is a recorded soft failure: the trail carries a row
+    // with the dial's real status, and the prompt moves to the next candidate at once — no retry
+    // at twice the cap (that retry is only for a missing token), no cooldown.
+    const invalid = validateUpstream(stream, outcome.text, upstreamBody, requires.tools === true);
+    if (invalid !== null) {
+      log(`prompt ${promptIndex}: ${model.id} answered with ${invalid}`);
+      failures.push({ status: 200, code: invalid, model: model.id });
       continue;
     }
     if (tokens.length > 0 && !tokens.some((token) => translated.answerText.includes(token))) {
