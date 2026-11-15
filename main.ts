@@ -25,13 +25,16 @@
 // refused model cools down for the next prompt (cooldowns count prompts, never wall time, so a
 // replay makes the same choices). A 401 ends the prompt at once: the key, not the model, is refused,
 // and no other model can answer. A 200 whose text never carries the prompt's token is a soft
-// failure — the model answered, but unproven — and the prompt moves on without a trail row, because
-// no refusal happened; the model is NOT cooled down for it, because a missed echo on one prompt is
-// weak evidence against the next, and quality outranks the one call a retry would cost.
+// failure — the model answered, but unproven. The model earns one retry at twice the output cap
+// before the prompt moves on: a reasoning model can spend a small cap before reaching content, and
+// a second dial with room to answer is worth more than abandoning the best-ranked candidate. The
+// retry carries no trail row, because no refusal happened, and the model is NOT cooled down for
+// it, because a missed echo on one prompt is weak evidence against the next.
 //
 // CAPS: at most 8 dials a prompt and 54 a trial (the gateway refuses past 60), counted, never timed.
-// Every dial names max_tokens. No wall clock and no randomness anywhere in a decision: every choice
-// derives from the brief, the requests, and the gateway's answers, so a replay leaves the same
+// Every dial names max_tokens, never below 1024 and never above 8192. No wall clock and no
+// randomness anywhere in a decision: every choice derives from the brief, the requests, and the
+// gateway's answers, so a replay leaves the same
 // export byte for byte. Completion requests run one at a time through a queue, in arrival order,
 // so the manifest row, the cooldowns and the call count can never interleave.
 //
@@ -82,6 +85,10 @@ const MAX_ATTEMPTS_PER_PROMPT = 8;
 const MAX_TRIAL_CALLS = 54;
 /** A refused model is skipped while the prompt index is below its refusal's index plus this. */
 const COOLDOWN_SPAN = 2;
+/** The least output tokens any upstream dial asks for: a smaller cap can strand a reasoning model before its content starts. */
+const MIN_UPSTREAM_MAX_TOKENS = 1024;
+/** The most output tokens any upstream dial asks for: the gateway refuses a larger ask. */
+const MAX_UPSTREAM_MAX_TOKENS = 8192;
 /** How many times /register is attempted before the server gives up. */
 const REGISTER_ATTEMPTS = 5;
 /** The fixed wait between /register attempts, in milliseconds: timing only, never a decision. */
@@ -337,9 +344,10 @@ type PromptOutcome =
 
 /**
  * Serve one prompt: walk the ranked candidates, dialling each at most once (plus one immediate
- * retry on a 5xx), skipping models in cooldown, until one answers with a body carrying the prompt's
- * token — or the attempt and trial caps run out. Deterministic in the brief, the request, the
- * prompt index, and the gateway's answers: no clock, no randomness.
+ * retry on a 5xx at the same cap, and one retry at twice the cap on a 200 without the token),
+ * skipping models in cooldown, until one answers with a body carrying the prompt's token — or the
+ * attempt and trial caps run out. Deterministic in the brief, the request, the prompt index, and
+ * the gateway's answers: no clock, no randomness.
  */
 async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<PromptOutcome> {
   const promptIndex = manifestIndex;
@@ -357,15 +365,19 @@ async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<Pr
   const failures: FailureRow[] = [];
   const tried = new Set<string>();
   const retried5xx = new Set<string>();
+  const retriedSoftFail = new Set<string>();
   let nextCandidate = 0;
-  let pendingRetry: ModelRow | null = null;
+  /** A same-model retry waiting to run, with the max_tokens its dial must ask for. */
+  let pendingRetry: { model: ModelRow; cap: number } | null = null;
   let attempts = 0;
   let lastStatus = 502;
 
   while (attempts < MAX_ATTEMPTS_PER_PROMPT && trialCalls < MAX_TRIAL_CALLS) {
     let model: ModelRow | null = null;
+    let retryCap: number | null = null;
     if (pendingRetry !== null) {
-      model = pendingRetry;
+      model = pendingRetry.model;
+      retryCap = pendingRetry.cap;
       pendingRetry = null;
     } else {
       while (nextCandidate < candidates.length) {
@@ -383,6 +395,12 @@ async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<Pr
     attempts += 1;
     trialCalls += 1;
     const upstreamBody = wire === 'openai' ? openAIUpstreamBody(body, model.id) : anthropicToOpenAI(body, model.id);
+    // Every dial asks for at least the floor: a smaller ask can strand a reasoning model before its
+    // content starts. A waiting retry names its own cap instead (the same cap after a 5xx, twice
+    // the cap after a 200 without the token), already clamped when it was queued.
+    const asked = typeof upstreamBody.max_tokens === 'number' ? upstreamBody.max_tokens : MIN_UPSTREAM_MAX_TOKENS;
+    const dialCap = retryCap ?? Math.max(asked, MIN_UPSTREAM_MAX_TOKENS);
+    upstreamBody.max_tokens = dialCap;
     const outcome = await dial(model.id, upstreamBody);
 
     if (outcome.kind === 'unreachable') {
@@ -392,7 +410,7 @@ async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<Pr
       lastStatus = 502;
       if (!retried5xx.has(model.id)) {
         retried5xx.add(model.id);
-        pendingRetry = model;
+        pendingRetry = { model, cap: dialCap };
       }
       continue;
     }
@@ -411,7 +429,7 @@ async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<Pr
       if (outcome.status === 401) break;
       if (outcome.status >= 500 && !retried5xx.has(model.id)) {
         retried5xx.add(model.id);
-        pendingRetry = model;
+        pendingRetry = { model, cap: dialCap };
       }
       continue;
     }
@@ -422,8 +440,15 @@ async function servePrompt(wire: 'openai' | 'anthropic', body: Json): Promise<Pr
     }
     if (tokens.length > 0 && !tokens.some((token) => translated.answerText.includes(token))) {
       // The model answered, but nothing proves it: no trail row (no refusal), no cooldown (a missed
-      // echo on this prompt is weak evidence against the next, and quality outranks one call).
+      // echo on this prompt is weak evidence against the next). One retry at twice the cap first:
+      // a reasoning model may have spent the whole smaller ask before its content started. No retry
+      // when doubling changes nothing (the cap is already at the gateway's ceiling).
       log(`prompt ${promptIndex}: ${model.id} answered without the prompt's token`);
+      const escalated = Math.min(dialCap * 2, MAX_UPSTREAM_MAX_TOKENS);
+      if (!retriedSoftFail.has(model.id) && escalated > dialCap) {
+        retriedSoftFail.add(model.id);
+        pendingRetry = { model, cap: escalated };
+      }
       continue;
     }
     log(`prompt ${promptIndex}: served by ${model.id} after ${attempts} attempt(s), ${failures.length} refusal(s)`);
